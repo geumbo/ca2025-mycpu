@@ -37,6 +37,21 @@ class PipelineProgramTest extends AnyFlatSpec with ChiselScalatestTester {
       }
     }
 
+    it should "pass uf8 encode/decode roundtrip test" in {
+      runProgram("uf8_test.asmbin", cfg) { c =>
+        c.clock.setTimeout(0)
+        // UF8 test loops 256 times testing encode/decode roundtrips
+        for (i <- 1 to 200) {
+          c.clock.step(1000)
+        }
+        // Check result at memory address 4: 1 = passed, 0 = failed
+        c.io.mem_debug_read_address.poke(4.U)
+        c.clock.step()
+        c.io.mem_debug_read_data.expect(1.U, "UF8 encode/decode roundtrip test failed")
+      }
+    }
+
+
     it should "quicksort 10 numbers" in {
       runProgram("quicksort.asmbin", cfg) { c =>
         for (i <- 1 to 50) {

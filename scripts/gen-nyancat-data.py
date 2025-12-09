@@ -35,7 +35,117 @@ import re
 import sys
 import urllib.request
 from pathlib import Path
-from typing import List, Tuple
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional
+import heapq
+
+class HuffmanNode:
+    def __init__(self, char: Optional[int], freq: int):
+        self.char = char
+        self.freq = freq
+        self.left = None
+        self.right = None
+
+    def __lt__(self, other):
+        return self.freq < other.freq
+
+def build_huffman_tree(data: List[int]) -> HuffmanNode:
+    # Frequency count
+    freq = {}
+    for char in data:
+        freq[char] = freq.get(char, 0) + 1
+    
+    # Priority queue
+    heap = [HuffmanNode(char, count) for char, count in freq.items()]
+    heapq.heapify(heap)
+    
+    # Build tree
+    while len(heap) > 1:
+        left = heapq.heappop(heap)
+        right = heapq.heappop(heap)
+        merged = HuffmanNode(None, left.freq + right.freq)
+        merged.left = left
+        merged.right = right
+        heapq.heappush(heap, merged)
+        
+    return heap[0] if heap else None
+
+def generate_codes(root: HuffmanNode, current_code: str, codes: Dict[int, Tuple[int, int]]):
+    if root is None:
+        return
+
+    if root.char is not None:
+        # Found leaf, store (int_value_of_code, length)
+        codes[root.char] = (int(current_code, 2) if current_code else 0, len(current_code))
+        return
+
+    generate_codes(root.left, current_code + "0", codes)
+    generate_codes(root.right, current_code + "1", codes)
+
+def serialize_huffman_tree(root: HuffmanNode) -> Tuple[List[int], List[int]]:
+    # Serialize Huffman Tree to flattened C-compatible arrays
+    # Protocol:
+    #   - Indices 0..255 are implicit Leaf Nodes (value = Opcode)
+    #   - Indices 256..N are Internal Nodes
+    #   - Array entries: value < 256 (Leaf), value >= 256 (Next Internal Node Index)
+    
+    # Map internal nodes to indices starting from 256
+    # BFS traversal ensures parent nodes are processed before children regarding index assignment logic
+    
+    table_left = []
+    table_right = []
+    
+    # Internal node queue for BFS construction
+    # Note: Root is effectively Internal Node 0 (Index 256 in theoretical space, but 0 in array)
+    internal_queue = [root]
+    
+    i = 0
+    while i < len(internal_queue):
+        curr = internal_queue[i] # This is internal node 'i'
+        i += 1
+        
+        # Process Left Child
+        if curr.left.char is not None:
+            left_val = curr.left.char # Leaf
+        else:
+            left_val = 256 + len(internal_queue) # Next available internal index
+            internal_queue.append(curr.left)
+            
+        # Process Right Child
+        if curr.right.char is not None:
+            right_val = curr.right.char # Leaf
+        else:
+            right_val = 256 + len(internal_queue)
+            internal_queue.append(curr.right)
+            
+        table_left.append(left_val)
+        table_right.append(right_val)
+        
+    return table_left, table_right
+
+def compress_data_huffman(data: List[int], codes: Dict[int, Tuple[int, int]]) -> bytes:
+    bit_buffer = 0
+    bit_count = 0
+    output = bytearray()
+    
+    for char in data:
+        code, length = codes[char]
+        
+        # Pack bits LSB-first into byte stream (matches C decoder behavior)
+        # Sequence: Bit 0 of Code -> LSB of Byte, Bit 1 -> Bit 1 ...
+        for i in range(length):
+            bit = (code >> (length - 1 - i)) & 1 # Extract bit from code (MSB to LSB as per string)
+            bit_buffer |= (bit << bit_count)
+            bit_count += 1
+            if bit_count == 8:
+                output.append(bit_buffer)
+                bit_buffer = 0
+                bit_count = 0
+                
+    if bit_count > 0:
+        output.append(bit_buffer)
+        
+    return bytes(output)
 
 
 def download_animation_data(url: str) -> str:
@@ -265,104 +375,130 @@ def compress_delta_frame(prev_pixels: List[str], curr_pixels: List[str]) -> List
     return opcodes
 
 
-def generate_header(frames: List[List[str]], output_path: Path, use_delta: bool = False) -> None:
+    opcodes.append(0xFF)
+    return opcodes
+
+def generate_header(frames: List[List[str]], output_path: Path, use_delta: bool = False, use_huffman: bool = False) -> None:
     """Generate nyancat-data.h with compressed frame data."""
 
-    # Compress all frames
-    compressed_frames = []
-
+    # Compress all frames (Opcode Generation Stage)
+    raw_opcodes_per_frame = []
+    
     if use_delta:
         # Frame 0: baseline RLE
-        baseline_opcodes = compress_frame_opcode_rle(frames[0])
-        compressed_frames.append(baseline_opcodes)
-        print(f"Frame  0 (baseline): {len(frames[0])} pixels → {len(baseline_opcodes)} opcodes ({100 - len(baseline_opcodes) * 100 // len(frames[0])}% reduction)")
-
+        raw_opcodes_per_frame.append(compress_frame_opcode_rle(frames[0]))
         # Frames 1-11: delta encoding
         for i in range(1, 12):
-            delta_opcodes = compress_delta_frame(frames[i-1], frames[i])
-            compressed_frames.append(delta_opcodes)
-            print(f"Frame {i:2d} (delta):    {len(frames[i])} pixels → {len(delta_opcodes)} opcodes ({100 - len(delta_opcodes) * 100 // len(frames[i])}% reduction)")
+            raw_opcodes_per_frame.append(compress_delta_frame(frames[i-1], frames[i]))
     else:
         # Baseline: opcode-RLE for all frames
-        for i, frame in enumerate(frames):
-            opcodes = compress_frame_opcode_rle(frame)
-            compressed_frames.append(opcodes)
-            print(f"Frame {i}: {len(frame)} pixels → {len(opcodes)} opcodes ({100 - len(opcodes) * 100 // len(frame)}% reduction)")
-
-    # Calculate frame offsets
-    offsets = [0]
-    for frame_data in compressed_frames[:-1]:
-        offsets.append(offsets[-1] + len(frame_data))
-
-    # Flatten all compressed data
-    all_data = []
-    for frame_data in compressed_frames:
-        all_data.extend(frame_data)
+        for frame in frames:
+            raw_opcodes_per_frame.append(compress_frame_opcode_rle(frame))
+            
+    # Flatten all opcodes to build a single Global Huffman Tree (better compression than per-frame)
+    all_opcodes = []
+    for frame_ops in raw_opcodes_per_frame:
+        all_opcodes.extend(frame_ops)
+        
+    final_data_bytes = []
+    
+    if use_huffman:
+        print("Building Huffman Tree...")
+        root = build_huffman_tree(all_opcodes)
+        codes = {}
+        generate_codes(root, "", codes)
+        
+        # Serialize Tree
+        tree_left, tree_right = serialize_huffman_tree(root)
+        
+        # Compress Data
+        # Compress frames individually to allow potential frame-based seeking/offsets
+        # Though current Huffman implementation is global-stream based, we process frame-by-frame for logic clarity
+        
+        compressed_frames = []
+        for ops in raw_opcodes_per_frame:
+            compressed_frames.append(compress_data_huffman(ops, codes))
+            
+        # Flatten compressed bytes
+        for cf in compressed_frames:
+            final_data_bytes.extend(cf)
+            
+        # Calculate offsets (byte aligned)
+        offsets = [0]
+        for cf in compressed_frames[:-1]:
+            offsets.append(offsets[-1] + len(cf))
+            
+    else:
+        # Just use the raw opcodes (RLE/Delta) as the "compressed" stream
+        # This matches original behavior
+        final_data_bytes = all_opcodes
+        
+        # Recalculate offsets based on raw opcode counts
+        offsets = [0]
+        for ops in raw_opcodes_per_frame[:-1]:
+            offsets.append(offsets[-1] + len(ops))
 
     total_original = 12 * 4096
-    total_compressed = len(all_data)
+    total_compressed = len(final_data_bytes)
+    
+    # Tree size in bytes (each internal node is 4 bytes: 2x uint16)
+    tree_size = 0
+    if use_huffman:
+        tree_size = len(tree_left) * 4
+        total_compressed += tree_size
+        
     reduction = 100 - (total_compressed * 100 // total_original)
 
-    print(f"\nTotal: {total_original} pixels → {total_compressed} opcodes ({reduction}% reduction)")
+    print(f"\nTotal: {total_original} pixels → {total_compressed} bytes ({reduction}% reduction)")
+    if use_huffman:
+         print(f"  - Stream: {len(final_data_bytes)} bytes")
+         print(f"  - Tree:   {tree_size} bytes ({len(tree_left)} nodes)")
 
     # Generate header file
-    compression_type = "delta-RLE" if use_delta else "opcode-RLE"
+    mode_str = "delta" if use_delta else "baseline"
+    if use_huffman: mode_str += "+huffman"
+    
     with open(output_path, 'w') as f:
-        f.write(f"""// SPDX-License-Identifier: MIT
-// Auto-generated nyancat animation data with {compression_type} compression
-// DO NOT EDIT - Generated by scripts/gen-nyancat-data.py
+        f.write(f"// SPDX-License-Identifier: MIT\n")
+        f.write(f"// Auto-generated nyancat animation data with {mode_str} compression\n")
+        f.write(f"// DO NOT EDIT - Generated by scripts/gen-nyancat-data.py\n\n")
+        f.write(f"#ifndef NYANCAT_DATA_H\n#define NYANCAT_DATA_H\n\n")
+        f.write(f"#include <stdint.h>\n\n")
+        
+        f.write(f"// Compression config\n")
+        f.write(f"#define NYANCAT_MODE_DELTA {1 if use_delta else 0}\n")
+        f.write(f"#define NYANCAT_MODE_HUFFMAN {1 if use_huffman else 0}\n\n")
+        
+        if use_huffman:
+            f.write(f"// Huffman Tree ({len(tree_left)} internal nodes)\n")
+            f.write(f"// Format: struct {{ uint16_t left; uint16_t right; }} nodes[];\n")
+            f.write(f"// If value < 256, it is a leaf (opcode). If >= 256, it is index of child node (val - 256).\n")
+            f.write(f"static const uint16_t nyancat_huffman_tree[{len(tree_left)}][2] = {{\n")
+            for l, r in zip(tree_left, tree_right):
+                f.write(f"    {{ {l}, {r} }},\n")
+            f.write(f"}};\n\n")
 
-#ifndef NYANCAT_DATA_H
-#define NYANCAT_DATA_H
-
-#include <stdint.h>
-
-// Compression type: {"delta" if use_delta else "baseline"}
-#define NYANCAT_COMPRESSION_DELTA {1 if use_delta else 0}
-
-// Frame offset table (12 frames)
-static const uint16_t nyancat_frame_offsets[12] = {{
-""")
-
-        # Write frame offsets
+        f.write(f"// Frame offset table\n")
+        f.write(f"static const uint16_t nyancat_frame_offsets[12] = {{\n")
         for i in range(0, len(offsets), 6):
             chunk = offsets[i:i+6]
-            f.write("    " + ", ".join(f"{offset:5d}" for offset in chunk))
-            if i + 6 < len(offsets):
-                f.write(",")
+            f.write("    " + ", ".join(f"{os:5d}" for os in chunk))
+            if i + 6 < len(offsets): f.write(",")
             f.write("\n")
-
         f.write("};\n\n")
-        f.write(f"// Compressed animation data ({len(all_data)} bytes)\n")
-
-        if use_delta:
-            f.write(f"// Delta encoding format:\n")
-            f.write(f"//   Frame 0 (baseline): 0x0X=SetColor, 0x2Y=Repeat(1-16), 0x3Y=Repeat*16(16-256)\n")
-            f.write(f"//   Frame 1-11 (delta):  0x0X=SetColor, 0x1Y=Skip(1-16), 0x2Y=Repeat(1-16),\n")
-            f.write(f"//                        0x3Y=Skip*16(16-256), 0x4Y=Repeat*16(16-256),\n")
-            f.write(f"//                        0x5Y=Skip*64(64-1024), 0xFF=EndOfFrame\n")
-        else:
-            f.write(f"// Opcode format:\n")
-            f.write(f"//   0x0X = SetColor (X = color 0-13)\n")
-            f.write(f"//   0x2Y = Repeat (Y+1) times (1-16 pixels)\n")
-            f.write(f"//   0x3Y = Repeat (Y+1)×16 times (16-256 pixels)\n")
-            f.write(f"//   0xFF = EndOfFrame\n")
-
-        f.write(f"static const uint8_t nyancat_compressed_data[{len(all_data)}] = {{\n")
-
-        # Write compressed data (16 bytes per line)
-        for i in range(0, len(all_data), 16):
-            chunk = all_data[i:i+16]
-            f.write("    " + ", ".join(f"0x{byte:02x}" for byte in chunk))
-            if i + 16 < len(all_data):
-                f.write(",")
+        
+        f.write(f"// Compressed data\n")
+        f.write(f"static const uint8_t nyancat_compressed_data[{len(final_data_bytes)}] = {{\n")
+        for i in range(0, len(final_data_bytes), 16):
+            chunk = final_data_bytes[i:i+16]
+            f.write("    " + ", ".join(f"0x{b:02x}" for b in chunk))
+            if i + 16 < len(final_data_bytes): f.write(",")
             f.write("\n")
-
         f.write("};\n\n")
-        f.write("#endif // NYANCAT_DATA_H\n")
+        f.write("#endif\n")
 
     print(f"\nGenerated: {output_path}")
-    print(f"Header size: {output_path.stat().st_size} bytes")
+
 
 
 def decompress_and_verify(frames: List[List[str]], use_delta: bool = False) -> bool:
@@ -507,6 +643,11 @@ def main():
         help='Use delta frame compression (default: baseline RLE)'
     )
     parser.add_argument(
+        '--huffman',
+        action='store_true',
+        help='Apply Huffman coding on top of RLE/Delta opcodes'
+    )
+    parser.add_argument(
         '--verify',
         action='store_true',
         help='Verify compression/decompression without generating output'
@@ -529,9 +670,11 @@ def main():
         sys.exit(0 if success else 1)
 
     # Generate header
-    compression_mode = "delta-RLE" if args.delta else "opcode-RLE"
+    compression_mode = "delta" if args.delta else "baseline"
+    if args.huffman: compression_mode += "+huffman"
+    
     print(f"\nCompressing frames with {compression_mode}...")
-    generate_header(frames, args.output, args.delta)
+    generate_header(frames, args.output, args.delta, args.huffman)
 
     # Run verification
     print("\nVerifying compression...")

@@ -104,7 +104,65 @@ static uint8_t prev_frame_buffer[FRAME_SIZE];  // Previous frame for delta
 // Upload compressed data size (defined in header)
 extern const uint8_t nyancat_compressed_data[];
 
-#if NYANCAT_COMPRESSION_DELTA
+extern const uint8_t nyancat_compressed_data[];
+
+// Stream Context for fetching opcodes
+typedef struct {
+    const uint8_t *ptr;
+    const uint8_t *end;
+    uint32_t bit_buffer;
+    int bit_count;
+} StreamContext;
+
+// Initialize stream
+static void stream_init(StreamContext *ctx, const uint8_t *start, const uint8_t *end) {
+    ctx->ptr = start;
+    ctx->end = end;
+    ctx->bit_buffer = 0;
+    ctx->bit_count = 0;
+}
+
+// Fetch next opcode (handles Huffman or Raw)
+static uint8_t fetch_opcode(StreamContext *ctx) {
+#if NYANCAT_MODE_HUFFMAN
+    // Huffman Decoding: Traverse the tree starting from Root (index 0)
+    uint16_t node_index = 0; 
+    
+    while (1) {
+        // Refill bit buffer if empty
+        if (ctx->bit_count == 0) {
+            if (ctx->ptr >= ctx->end) return 0xFF; // EOF safety
+            ctx->bit_buffer = *ctx->ptr++;
+            ctx->bit_count = 8;
+        }
+        
+        // Extract 1 bit (LSB first, matching Python bit packing)
+        uint8_t bit = ctx->bit_buffer & 1;
+        ctx->bit_buffer >>= 1;
+        ctx->bit_count--;
+        
+        // Traverse Huffman Tree
+        // If bit=0 -> Left Child, bit=1 -> Right Child
+        // Table values < 256 are Leaf Nodes (Opcodes)
+        // Table values >= 256 are Internal Nodes (Index + 256)
+        
+        uint16_t next_val = (bit == 0) ? nyancat_huffman_tree[node_index][0] 
+                                       : nyancat_huffman_tree[node_index][1];
+                                       
+        if (next_val < 256) {
+            return (uint8_t)next_val; // Leaf
+        } else {
+            node_index = next_val - 256; // Move to next internal node
+        }
+    }
+#else
+    // Raw byte access
+    if (ctx->ptr >= ctx->end) return 0xFF;
+    return *ctx->ptr++;
+#endif
+}
+
+#if NYANCAT_MODE_DELTA || NYANCAT_COMPRESSION_DELTA
 
 // Delta frame decompression
 // Frame 0 (baseline): 0x0X=SetColor, 0x2Y=Repeat(1-16), 0x3Y=Repeat*16(16-256)
@@ -128,10 +186,12 @@ void vga_upload_frame_delta(int frame_index)
         // Frame 0: baseline RLE decompression
         int output_index = 0;
         uint8_t current_color = 0;
-        const uint8_t *p = compressed_data;
+        
+        StreamContext stream;
+        stream_init(&stream, compressed_data, data_end);
 
-        while (output_index < FRAME_SIZE && p < data_end) {
-            uint8_t opcode = *p++;
+        while (output_index < FRAME_SIZE) {
+            uint8_t opcode = fetch_opcode(&stream);
 
             if (opcode == END_OF_FRAME) {
                 break;  // End of frame
@@ -161,10 +221,12 @@ void vga_upload_frame_delta(int frame_index)
 
         int pos = 0;
         uint8_t current_color = 0;
-        const uint8_t *p = compressed_data;
+        
+        StreamContext stream;
+        stream_init(&stream, compressed_data, data_end);
 
-        while (pos < FRAME_SIZE && p < data_end) {
-            uint8_t opcode = *p++;
+        while (pos < FRAME_SIZE) {
+            uint8_t opcode = fetch_opcode(&stream);
 
             if (opcode == END_OF_FRAME) {
                 break;  // End of frame
@@ -224,10 +286,12 @@ void vga_upload_frame_rle(int frame_index)
     // Decompress frame into buffer
     int output_index = 0;
     uint8_t current_color = 0;
-    const uint8_t *p = rle_data;
+    
+    StreamContext stream;
+    stream_init(&stream, rle_data, data_end);
 
-    while (output_index < FRAME_SIZE && p < data_end) {
-        uint8_t opcode = *p++;
+    while (output_index < FRAME_SIZE) {
+        uint8_t opcode = fetch_opcode(&stream);
 
         if (opcode == END_OF_FRAME) {
             break;  // End of frame
@@ -277,7 +341,7 @@ int main(void)
     vga_init_palette();
     vga_write32(VGA_CTRL, 0x01);
 
-#if NYANCAT_COMPRESSION_DELTA
+#if NYANCAT_MODE_DELTA || NYANCAT_COMPRESSION_DELTA
     // Upload all frames (delta decompression)
     for (int frame = 0; frame < FRAME_COUNT; frame++) {
         vga_upload_frame_delta(frame);
